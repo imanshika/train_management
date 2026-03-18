@@ -1,6 +1,6 @@
 # Train Platform Management System
 
-A low-level design (LLD) / machine coding implementation for managing train-to-platform assignments at a railway station, with conflict detection, scheduling, and strategy-based auto-assignment.
+A low-level design (LLD) / machine coding implementation for managing train-to-platform assignments at a railway station, with conflict detection, scheduling, strategy-based auto-assignment, and event-driven notifications.
 
 ## Problem Statement
 
@@ -48,8 +48,11 @@ Design a system that manages train arrivals and departures across multiple platf
 | 9  | Update Schedule Status     | Transition status: SCHEDULED → ARRIVED → DEPARTED        |
 | 10 | Auto-Assign Platform       | System picks a platform using a pluggable strategy       |
 | 11 | Remove Train / Platform    | Delete entities from the system                          |
+| 12 | Event Notifications        | Observers notified on every schedule status change       |
 
-## Strategy Pattern — Auto Platform Assignment
+## Design Patterns Used
+
+### 1. Strategy Pattern — Auto Platform Assignment
 
 When a train needs a platform but doesn't specify which one, the system auto-assigns using a pluggable strategy:
 
@@ -70,6 +73,51 @@ FirstAvailable  LeastUsed   RandomAssignment
 | `LeastUsedStrategy`       | Picks platform with fewest total schedules | Even load distribution             |
 | `RandomAssignmentStrategy`| Picks a random available platform          | Load balancing without bias        |
 
+### 2. Factory Pattern — Strategy Creation
+
+`StrategyFactory` decouples strategy selection from instantiation. Strategies are looked up by name instead of using `new` directly:
+
+```java
+StrategyFactory.getStrategy("FIRST_AVAILABLE")   // returns FirstAvailableStrategy
+StrategyFactory.getStrategy("LEAST_USED")         // returns LeastUsedStrategy
+StrategyFactory.getStrategy("RANDOM")             // returns RandomAssignmentStrategy
+StrategyFactory.registerStrategy("CUSTOM", new MyStrategy())  // extensible at runtime
+```
+
+### 3. Observer Pattern — Event Notifications
+
+When a schedule status changes, all registered observers are notified automatically:
+
+```
+ScheduleService (Publisher)
+  │  updateStatus()
+  │  cancelSchedule()
+  │  addSchedule()
+  │
+  └── notifyObservers(schedule, oldStatus, newStatus)
+            │
+            ├── DisplayBoardObserver           → [DISPLAY] logs every status change
+            ├── PassengerNotificationObserver   → [ALERT] notifies on ARRIVED, CANCELLED
+            └── CleanupCrewObserver             → [NOTIFY] triggers on DEPARTED only
+```
+
+Observers are registered externally (not in the constructor), keeping `ScheduleService` decoupled from concrete observer implementations.
+
+## Concurrency
+
+Thread safety is handled at multiple levels:
+
+| Layer | Mechanism | Purpose |
+|-------|-----------|---------|
+| Repositories | `ConcurrentHashMap` | Thread-safe individual read/write operations |
+| ScheduleService | `ReadWriteLock` per platform | Prevents check-then-act race condition in scheduling |
+| Observer list | `CopyOnWriteArrayList` | Safe iteration during notifications while allowing concurrent registration |
+
+**ReadWriteLock strategy:**
+- **Write lock** (exclusive) — `addSchedule`, `modifySchedule`, `cancelSchedule`, `updateStatus`
+- **Read lock** (shared, concurrent) — `getSchedulesByPlatform`, `getAvailablePlatforms`
+- Locks are **per-platform** — operations on different platforms don't block each other
+
 ## Key Design Decisions
 
 - **In-memory storage** — `ConcurrentHashMap` backed repositories for thread-safe reads/writes.
@@ -78,6 +126,9 @@ FirstAvailable  LeastUsed   RandomAssignment
 - **UUID-based IDs** — generated in the service layer using `UUID.randomUUID()`.
 - **Unchecked exceptions** — all custom exceptions extend `RuntimeException` to keep service signatures clean.
 - **Strategy pattern** — for auto platform assignment, allowing new assignment policies without modifying existing code (Open/Closed Principle).
+- **Factory pattern** — for strategy creation, decoupling selection from instantiation.
+- **Observer pattern** — for event-driven notifications, decoupling the publisher from subscribers.
+- **Per-platform locking** — `ReadWriteLock` per platform for fine-grained concurrency control.
 
 ## Custom Exceptions
 
@@ -106,15 +157,21 @@ src/main/java/
     │   ├── TrainRepository.java               # ConcurrentHashMap<String, Train>
     │   ├── PlatformRepository.java            # ConcurrentHashMap<String, Platform>
     │   └── ScheduleRepository.java            # ConcurrentHashMap<String, Schedule>
-    ├── services/
+    ├── service/
     │   ├── TrainService.java                  # CRUD for trains
     │   ├── PlatformService.java               # CRUD for platforms
-    │   └── ScheduleService.java               # Scheduling, conflict detection, auto-assign
+    │   └── ScheduleService.java               # Scheduling, conflict detection, auto-assign, notifications
     ├── strategy/
     │   ├── PlatformAssignmentStrategy.java    # Strategy interface
     │   ├── FirstAvailableStrategy.java        # Lowest platform number
     │   ├── LeastUsedStrategy.java             # Fewest total schedules
-    │   └── RandomAssignmentStrategy.java      # Random pick
+    │   ├── RandomAssignmentStrategy.java      # Random pick
+    │   └── StrategyFactory.java               # Factory for strategy lookup
+    ├── observer/
+    │   ├── ScheduleObserver.java              # Observer interface
+    │   ├── DisplayBoardObserver.java          # Logs all status changes
+    │   ├── PassengerNotificationObserver.java # Alerts on ARRIVED, CANCELLED
+    │   └── CleanupCrewObserver.java           # Triggers on DEPARTED
     └── exceptions/
         ├── TrainNotFoundException.java
         ├── PlatformNotFoundException.java
@@ -129,5 +186,6 @@ ScheduleService  ──→  ScheduleRepository
        │
        ├──→  TrainService      ──→  TrainRepository
        ├──→  PlatformService   ──→  PlatformRepository
-       └──→  PlatformAssignmentStrategy (injected per call)
+       ├──→  PlatformAssignmentStrategy (injected per call via StrategyFactory)
+       └──→  List<ScheduleObserver> (registered externally)
 ```
